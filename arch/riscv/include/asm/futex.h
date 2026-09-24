@@ -13,6 +13,10 @@
 #include <asm/asm.h>
 #include <asm/asm-extable.h>
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+#include <asm-generic/futex.h>
+#else
+
 /* We don't even really need the extable code, but for now keep it simple */
 #ifndef CONFIG_MMU
 #define __enable_user_access()		do { } while (0)
@@ -100,5 +104,7 @@ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 	*uval = val;
 	return ret;
 }
+
+#endif /* !CONFIG_CVA6_F2_NO_AMO */
 
 #endif /* _ASM_RISCV_FUTEX_H */

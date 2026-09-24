@@ -46,6 +46,7 @@ endif
 extra-y += vmlinux.lds
 
 obj-y	+= head.o
+obj-$(CONFIG_CVA6_F2_NO_AMO) += cva6_f2_early.o
 obj-y	+= soc.o
 obj-$(CONFIG_RISCV_ALTERNATIVE) += alternative.o
 obj-y	+= cpu.o

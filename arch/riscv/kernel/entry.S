@@ -71,8 +71,14 @@ _new_vmalloc_kernel_address:
 	and	a2, a2, a1
 	beq	a2, zero, _new_vmalloc_restore_context
 
-	/* Atomically reset the current cpu bit in new_vmalloc */
+	/* Reset the current cpu bit in new_vmalloc */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	REG_L	a2, 0(a0)
+	xor	a2, a2, a1
+	REG_S	a2, 0(a0)
+#else
 	amoxor.d	a0, a1, (a0)
+#endif
 
 	/* Only emit a sfence.vma if the uarch caches invalid entries */
 	ALTERNATIVE("sfence.vma", "nop", 0, RISCV_ISA_EXT_SVVPTC, 1)
@@ -260,7 +266,10 @@ SYM_CODE_START_NOALIGN(ret_from_exception)
 	 * arbitrarily large.
 	 */
 	REG_L  a2, PT_EPC(sp)
+#ifndef CONFIG_CVA6_F2_NO_AMO
+	/* Dummy SC clears a dangling LR reservation. SC never completes on F2 HBM. */
 	REG_SC x0, a2, PT_EPC(sp)
+#endif
 
 	csrw CSR_STATUS, a0
 	csrw CSR_EPC, a2

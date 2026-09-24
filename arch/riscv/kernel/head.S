@@ -17,6 +17,59 @@
 #include <asm/xip_fixup.h>
 #include "efi-header.S"
 
+/* AWS F2 host_uart THR @ 0x10000000 (debug milestones; fold when boot is stable) */
+.macro f2_uart ch
+	li	t0, 0x10000000
+	li	t1, \ch
+	sb	t1, 0(t0)
+.endm
+
+/* #region agent log: tag already printed; print 16 hex digits of \reg */
+.macro f2_uart_hex64 reg, sh, nib, tcmp
+	li	\sh, 60
+.Lf2_hex\@:
+	srl	\nib, \reg, \sh
+	andi	\nib, \nib, 0xf
+	li	\tcmp, 10
+	blt	\nib, \tcmp, .Lf2_hex_lo\@
+	addi	\nib, \nib, ('a' - 10)
+	j	.Lf2_hex_out\@
+.Lf2_hex_lo\@:
+	addi	\nib, \nib, '0'
+.Lf2_hex_out\@:
+	li	t0, 0x10000000
+	sb	\nib, 0(t0)
+	li	\tcmp, 4
+	sub	\sh, \sh, \tcmp
+	bgez	\sh, .Lf2_hex\@
+.endm
+
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	.globl f2_earlycon_uart_va
+	.globl f2_satp_early_pgdir
+/*
+ * link VA -> PA while MMU is off. Do not load kernel_map here: its symbol
+ * address is a link VA and loads fault/misread before SATP (wrong SATP PPN).
+ */
+.macro f2_link_to_phys link_reg, scratch1, scratch2
+	/*
+	 * MMU-off: symbol lla values may all be load PA or all link VA; the
+	 * delta (sym - _start) matches the link-time layout. Rebasing that
+	 * delta onto OpenSBI load PA 0x80200000 yields the true symbol PA.
+	 */
+	lla \scratch1, _start
+	li \scratch2, 0x80200000
+	sub \link_reg, \link_reg, \scratch1
+	add \link_reg, \link_reg, \scratch2
+.endm
+.macro f2_uart_virt ch
+	lla	t0, f2_earlycon_uart_va
+	REG_L	t0, 0(t0)
+	li	t1, \ch
+	sb	t1, 0(t0)
+.endm
+#endif
+
 __HEAD
 SYM_CODE_START(_start)
 	/*
@@ -72,26 +125,71 @@ pe_head_start:
 #ifdef CONFIG_MMU
 	.global relocate_enable_mmu
 relocate_enable_mmu:
-	/* Relocate return address */
+	f2_uart '0'
+	/* Relocate return address / virt offset for stvec (MMU still off). */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	li a1, 0x80200000
+	li a2, KERNEL_LINK_ADDR
+	sub a2, a2, a1
+	add ra, ra, a2
+	mv t6, a2
+#else
 	la a1, kernel_map
 	XIP_FIXUP_OFFSET a1
 	REG_L a1, KERNEL_MAP_VIRT_ADDR(a1)
 	la a2, _start
 	sub a1, a1, a2
 	add ra, ra, a1
+	mv t6, a1
+#endif
 
 	/* Point stvec to virtual address of intruction after satp write */
 	la a2, 1f
-	add a2, a2, a1
+	add a2, a2, t6
 	csrw CSR_TVEC, a2
 
 	/* Compute satp for kernel page tables, but don't load it yet */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	/* Root @ load PA of early_pg_dir; satp_mode in .data (same as stock path). */
+	lla a0, early_pg_dir
+	f2_link_to_phys a0, a3, a4
+	srli a2, a0, PAGE_SHIFT
+	/* satp_mode lives in .data; MMU-off ld can read garbage — use Sv39 mode. */
+	li a1, 8
+	slli a1, a1, 60
+	or a2, a2, a1
+	/* #region agent log: B + SATP value loaded (compare to setup_vm S… block) */
+	f2_uart 'B'
+	f2_uart_hex64 a2, a4, a5, a3
+	/* #endregion */
+#else
+	la a0, early_pg_dir
+	XIP_FIXUP_OFFSET a0
 	srl a2, a0, PAGE_SHIFT
 	la a1, satp_mode
 	XIP_FIXUP_OFFSET a1
 	REG_L a1, 0(a1)
 	or a2, a2, a1
+#endif
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	/*
+	 * Identity-mapped early_pg_dir in setup_vm(): enable MMU in one step
+	 * (no trampoline SATP — CVA6 hangs instead of trapping to stvec).
+	 */
+	sfence.vma
+	f2_uart '1'
+	f2_uart '!'
+	fence.i
+	csrw CSR_SATP, a2
+	/* #region agent log: b + SATP CSR readback after csrw */
+	csrr	a4, CSR_SATP
+	f2_uart 'b'
+	f2_uart_hex64 a4, a5, a3, t2
+	/* #endregion */
+	/* MMIO 0x10000000 is identity-mapped; avoid fixmap ld before paging is stable */
+	f2_uart '>'
+#else
 	/*
 	 * Load trampoline page directory, which will cause us to trap to
 	 * stvec if VA != PA, or simply fall through if VA == PA.  We need a
@@ -103,16 +201,37 @@ relocate_enable_mmu:
 	srl a0, a0, PAGE_SHIFT
 	or a0, a0, a1
 	sfence.vma
+	f2_uart '1'
 	csrw CSR_SATP, a0
+	/* #region agent log */
+	f2_uart '>'
+	/* #endregion */
+#endif
 .align 2
 1:
-	/* Set trap vector to spin forever to help debug */
-	la a0, .Lsecondary_park
-	csrw CSR_TVEC, a0
-
+	/* #region agent log */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	f2_uart '@'
+#else
+	f2_uart '@'
+#endif
+	/* #endregion */
+	sfence.vma
+	f2_uart '2'
 	/* Reload the global pointer */
 	load_global_pointer
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	/*
+	 * Label 1 runs at the physical PC (identity map, no stvec trampoline).
+	 * la therefore loads the PA of __global_pointer$. ret below enters the
+	 * kernel VA, so gp-relative accesses (acpi_disabled, …) must use the VA.
+	 * t6 is still KERNEL_LINK_ADDR - 0x80200000.
+	 */
+	add gp, gp, t6
+#endif
 
+	f2_uart '3'
+#ifndef CONFIG_CVA6_F2_NO_AMO
 	/*
 	 * Switch to kernel page tables.  A full fence is necessary in order to
 	 * avoid using the trampoline translations, which are only correct for
@@ -121,6 +240,21 @@ relocate_enable_mmu:
 	 */
 	csrw CSR_SATP, a2
 	sfence.vma
+#endif
+	f2_uart '4'
+	/* Set trap vector after MMU is fully enabled */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	/*
+	 * .Lsecondary_park (wfi) loses delegated IRQs before .Lsetup_trap_vector;
+	 * RVFI showed boot hart stuck @ 0x802010d8 after @234.
+	 */
+	la a0, handle_exception
+	csrw CSR_TVEC, a0
+	csrw CSR_SCRATCH, zero
+#else
+	la a0, .Lsecondary_park
+	csrw CSR_TVEC, a0
+#endif
 
 	ret
 #endif /* CONFIG_MMU */
@@ -195,6 +329,7 @@ secondary_start_sbi:
 SYM_CODE_END(_start)
 
 SYM_CODE_START(_start_kernel)
+	f2_uart 'K'
 	/* Mask all interrupts */
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero
@@ -289,6 +424,7 @@ SYM_CODE_START(_start_kernel)
 	blt a3, a4, .Lclear_bss
 .Lclear_bss_done:
 #endif
+	f2_uart 'B'
 	la a2, boot_cpu_hartid
 	XIP_FIXUP_OFFSET a2
 	REG_S a0, (a2)
@@ -309,11 +445,13 @@ SYM_CODE_START(_start_kernel)
 	la a3, .Lsecondary_park
 	csrw CSR_TVEC, a3
 	call setup_vm
+	f2_uart 'V'
 #ifdef CONFIG_MMU
 	la a0, early_pg_dir
 	XIP_FIXUP_OFFSET a0
 	call relocate_enable_mmu
 #endif /* CONFIG_MMU */
+	f2_uart 'M'
 
 	call .Lsetup_trap_vector
 	/* Restore C environment */
@@ -327,6 +465,7 @@ SYM_CODE_START(_start_kernel)
 #endif
 	/* Start the kernel */
 	call soc_early_init
+	f2_uart 'S'
 	tail start_kernel
 
 #ifdef CONFIG_RISCV_BOOT_SPINWAIT

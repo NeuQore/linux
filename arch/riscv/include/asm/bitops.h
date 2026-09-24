@@ -185,6 +185,91 @@ legacy:
 
 #include <asm-generic/bitops/const_hweight.h>
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+/*
+ * HBM never completes AMO. UP kernel: IRQ-masked RMW, same as cva6_f2_namo.h.
+ */
+#define __cva6_f2_bit_rmw(flags, stmt)					\
+	do {								\
+		local_irq_save(flags);					\
+		stmt;							\
+		local_irq_restore(flags);				\
+	} while (0)
+
+static inline int arch_test_and_set_bit(int nr, volatile unsigned long *addr)
+{
+	unsigned long flags, mask, old, *p;
+
+	mask = BIT_MASK(nr);
+	p = ((unsigned long *)addr) + BIT_WORD(nr);
+	__cva6_f2_bit_rmw(flags, { old = *p; *p = old | mask; });
+	return (old & mask) != 0;
+}
+
+static inline int arch_test_and_clear_bit(int nr, volatile unsigned long *addr)
+{
+	unsigned long flags, mask, old, *p;
+
+	mask = BIT_MASK(nr);
+	p = ((unsigned long *)addr) + BIT_WORD(nr);
+	__cva6_f2_bit_rmw(flags, { old = *p; *p = old & ~mask; });
+	return (old & mask) != 0;
+}
+
+static inline int arch_test_and_change_bit(int nr, volatile unsigned long *addr)
+{
+	unsigned long flags, mask, old, *p;
+
+	mask = BIT_MASK(nr);
+	p = ((unsigned long *)addr) + BIT_WORD(nr);
+	__cva6_f2_bit_rmw(flags, { old = *p; *p = old ^ mask; });
+	return (old & mask) != 0;
+}
+
+static inline void arch_set_bit(int nr, volatile unsigned long *addr)
+{
+	arch_test_and_set_bit(nr, addr);
+}
+
+static inline void arch_clear_bit(int nr, volatile unsigned long *addr)
+{
+	arch_test_and_clear_bit(nr, addr);
+}
+
+static inline void arch_change_bit(int nr, volatile unsigned long *addr)
+{
+	arch_test_and_change_bit(nr, addr);
+}
+
+static inline int arch_test_and_set_bit_lock(unsigned long nr,
+					     volatile unsigned long *addr)
+{
+	return arch_test_and_set_bit(nr, addr);
+}
+
+static inline void arch_clear_bit_unlock(unsigned long nr,
+					 volatile unsigned long *addr)
+{
+	arch_clear_bit(nr, addr);
+}
+
+static inline void arch___clear_bit_unlock(unsigned long nr,
+					   volatile unsigned long *addr)
+{
+	arch_clear_bit_unlock(nr, addr);
+}
+
+static inline bool arch_xor_unlock_is_negative_byte(unsigned long mask,
+		volatile unsigned long *addr)
+{
+	unsigned long flags, old;
+
+	__cva6_f2_bit_rmw(flags, { old = *addr; *addr = old ^ mask; });
+	return (old & BIT(7)) != 0;
+}
+
+#else /* !CONFIG_CVA6_F2_NO_AMO */
+
 #if (BITS_PER_LONG == 64)
 #define __AMO(op)	"amo" #op ".d"
 #elif (BITS_PER_LONG == 32)
@@ -368,6 +453,8 @@ static inline bool arch_xor_unlock_is_negative_byte(unsigned long mask,
 #undef __NOP
 #undef __NOT
 #undef __AMO
+
+#endif /* !CONFIG_CVA6_F2_NO_AMO */
 
 #include <asm-generic/bitops/instrumented-atomic.h>
 #include <asm-generic/bitops/instrumented-lock.h>

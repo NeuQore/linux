@@ -1157,6 +1157,14 @@ config PORTABLE
 config ARCH_PROC_KCORE_TEXT
 	def_bool y
 
+config CVA6_F2_NO_AMO
+	bool "AWS F2 CVA6: software atomics (HBM has no AMO/LR-SC)"
+	depends on !SMP
+	help
+	  On the AWS F2 cl_cva6_linux DRAM port, AMO and LR/SC never
+	  complete. Select this for UP kernels that use IRQ-masked
+	  atomics instead of A-extension instructions.
+
 menu "Power management options"
 
 source "kernel/power/Kconfig"

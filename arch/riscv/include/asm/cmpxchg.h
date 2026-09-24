@@ -6,6 +6,10 @@
 #ifndef _ASM_RISCV_CMPXCHG_H
 #define _ASM_RISCV_CMPXCHG_H
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+#include <asm/cva6_f2_namo.h>
+#else /* CONFIG_CVA6_F2_NO_AMO */
+
 #include <linux/bug.h>
 
 #include <asm/alternative-macros.h>
@@ -280,5 +284,7 @@ no_zawrs:
 #define __cmpwait_relaxed(ptr, val) \
 	__cmpwait((ptr), (unsigned long)(val), sizeof(*(ptr)))
 #endif
+
+#endif /* !CONFIG_CVA6_F2_NO_AMO */
 
 #endif /* _ASM_RISCV_CMPXCHG_H */

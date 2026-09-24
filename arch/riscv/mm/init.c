@@ -46,15 +46,23 @@ EXPORT_SYMBOL(kernel_map);
 #endif
 
 #ifdef CONFIG_64BIT
+#ifdef CONFIG_CVA6_F2_NO_AMO
+u64 satp_mode __ro_after_init = SATP_MODE_39;
+bool pgtable_l4_enabled __ro_after_init = false;
+bool pgtable_l5_enabled __ro_after_init = false;
+#else
 u64 satp_mode __ro_after_init = !IS_ENABLED(CONFIG_XIP_KERNEL) ? SATP_MODE_57 : SATP_MODE_39;
+#endif
 #else
 u64 satp_mode __ro_after_init = SATP_MODE_32;
 #endif
 EXPORT_SYMBOL(satp_mode);
 
 #ifdef CONFIG_64BIT
+#ifndef CONFIG_CVA6_F2_NO_AMO
 bool pgtable_l4_enabled __ro_after_init = !IS_ENABLED(CONFIG_XIP_KERNEL);
 bool pgtable_l5_enabled __ro_after_init = !IS_ENABLED(CONFIG_XIP_KERNEL);
+#endif
 EXPORT_SYMBOL(pgtable_l4_enabled);
 EXPORT_SYMBOL(pgtable_l5_enabled);
 #endif
@@ -807,6 +815,12 @@ static __init void set_satp_mode(uintptr_t dtb_pa)
 	uintptr_t set_satp_mode_pmd = ((unsigned long)set_satp_mode) & PMD_MASK;
 	u64 satp_mode_cmdline = __pi_set_satp_mode_from_cmdline(dtb_pa);
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	disable_pgtable_l5();
+	disable_pgtable_l4();
+	return;
+#endif
+
 	if (satp_mode_cmdline == SATP_MODE_57) {
 		disable_pgtable_l5();
 	} else if (satp_mode_cmdline == SATP_MODE_48) {
@@ -951,6 +965,114 @@ static void __init create_kernel_page_table(pgd_t *pgdir, bool early)
 }
 #endif
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+extern unsigned long f2_earlycon_uart_va;
+#ifdef CONFIG_CVA6_F2_NO_AMO
+extern u64 f2_satp_early_pgdir;
+#endif
+
+#define F2_LOAD_PA	0x80200000UL
+#define F2_LINK_BASE	0xffffffff80000000UL
+
+static __init uintptr_t f2_link_va_to_phys(uintptr_t link_va)
+{
+	uintptr_t va = kernel_map.virt_addr;
+	uintptr_t pa = kernel_map.phys_addr;
+	uintptr_t end;
+
+	if (!va)
+		va = _AC(CONFIG_PAGE_OFFSET, UL) + kernel_map.virt_offset;
+	if (!va)
+		va = F2_LINK_BASE;
+	if (!pa)
+		pa = F2_LOAD_PA;
+
+	end = pa + kernel_map.size;
+	/*
+	 * MMU-off: &sym may be a runtime load PA (sometimes +2MiB skew). Re-base
+	 * to link VA, then apply the standard load-PA mapping.
+	 */
+	/*
+	 * Linker symbols stay at KERNEL_LINK_ADDR; KASLR only shifts
+	 * kernel_map.virt_addr, not the load image layout at phys_addr.
+	 */
+	if (link_va >= F2_LINK_BASE)
+		return pa + (link_va - F2_LINK_BASE);
+	if (link_va >= pa && link_va < end)
+		link_va = F2_LINK_BASE + (link_va - pa);
+
+	return pa + (link_va - F2_LINK_BASE);
+}
+
+static __init void *f2_early_ptr(void *link_va)
+{
+	return (void *)f2_link_va_to_phys((uintptr_t)link_va);
+}
+
+static phys_addr_t __init f2_alloc_pmd_early(uintptr_t va)
+{
+	BUG_ON((va - kernel_map.virt_addr) >> PUD_SHIFT);
+
+	return (uintptr_t)f2_early_ptr(early_pmd);
+}
+
+static phys_addr_t __init f2_alloc_pud_early(uintptr_t va)
+{
+	BUG_ON((va - kernel_map.virt_addr) >> PGDIR_SHIFT);
+
+	return (uintptr_t)f2_early_ptr(early_pud);
+}
+
+/* #region agent log: UART @ 0x10000000 — tag + 16 hex nibbles (64-bit) */
+static void __init f2_uart_tag_hex64(char tag, u64 val)
+{
+	void __iomem *uart = (void __iomem *)0x10000000UL;
+	int shift;
+
+	writeb(tag, uart);
+	for (shift = 60; shift >= 0; shift -= 4) {
+		u8 n = (val >> shift) & 0xf;
+		char c = n < 10 ? ('0' + n) : ('a' + n - 10);
+
+		writeb(c, uart);
+	}
+}
+
+/*
+ * Dump early page tables for post-MMU IAF @ do_trap_insn_fault (0xffffffff80b589a6).
+ * Tags: L=phys_addr A=early_pg_dir PA S=satp K/F=pgd[idx] m=pmd[idx] for fault VA.
+ */
+static void __init f2_uart_readback_early_pt(u64 satp_val)
+{
+	pgd_t *pgd = f2_early_ptr(early_pg_dir);
+	uintptr_t va_kern = kernel_map.virt_addr;
+	uintptr_t va_fault = 0xffffffff80b589a6UL;
+	pgd_t g_kern = pgd[pgd_index(va_kern)];
+	pgd_t g_fault = pgd[pgd_index(va_fault)];
+	u64 pmd_fault = 0;
+
+	if (pgd_val(g_fault) & _PAGE_PRESENT) {
+		if (pgd_val(g_fault) & _PAGE_LEAF)
+			pmd_fault = pgd_val(g_fault);
+		else {
+			pmd_t *pmdp = get_pmd_virt_early(PFN_PHYS(_pgd_pfn(g_fault)));
+
+			pmd_fault = pmd_val(pmdp[pmd_index(va_fault)]);
+		}
+	}
+
+	f2_uart_tag_hex64('L', kernel_map.phys_addr);
+	f2_uart_tag_hex64('V', kernel_map.virt_addr);
+	f2_uart_tag_hex64('A', (uintptr_t)f2_early_ptr(early_pg_dir));
+	f2_uart_tag_hex64('S', satp_val);
+	f2_uart_tag_hex64('K', pgd_val(g_kern));
+	f2_uart_tag_hex64('F', pgd_val(g_fault));
+	f2_uart_tag_hex64('m', pmd_fault);
+	writeb('W', (void __iomem *)0x10000000UL);
+}
+/* #endregion */
+#endif
+
 /*
  * Setup a 4MB mapping that encompasses the device tree: for 64-bit kernel,
  * this means 2 PMD entries whereas for 32-bit kernel, this is only 1 PGDIR
@@ -970,10 +1092,18 @@ static void __init create_fdt_early_page_table(uintptr_t fix_fdt_va,
 		create_pgd_mapping(early_pg_dir, fix_fdt_va,
 				   pa, MAX_FDT_SIZE, PAGE_KERNEL);
 	} else {
+#ifdef CONFIG_CVA6_F2_NO_AMO
+		pmd_t *fix_pmd = f2_early_ptr(fixmap_pmd);
+
+		create_pmd_mapping(fix_pmd, fix_fdt_va, pa, PMD_SIZE, PAGE_KERNEL);
+		create_pmd_mapping(fix_pmd, fix_fdt_va + PMD_SIZE,
+				   pa + PMD_SIZE, PMD_SIZE, PAGE_KERNEL);
+#else
 		create_pmd_mapping(fixmap_pmd, fix_fdt_va,
 				   pa, PMD_SIZE, PAGE_KERNEL);
 		create_pmd_mapping(fixmap_pmd, fix_fdt_va + PMD_SIZE,
 				   pa + PMD_SIZE, PMD_SIZE, PAGE_KERNEL);
+#endif
 	}
 
 	dtb_early_va = (void *)fix_fdt_va + (dtb_pa & (PMD_SIZE - 1));
@@ -999,10 +1129,17 @@ static void __init pt_ops_set_early(void)
 	pt_ops.alloc_pte = alloc_pte_early;
 	pt_ops.get_pte_virt = get_pte_virt_early;
 #ifndef __PAGETABLE_PMD_FOLDED
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	pt_ops.alloc_pmd = f2_alloc_pmd_early;
+	pt_ops.get_pmd_virt = get_pmd_virt_early;
+	pt_ops.alloc_pud = f2_alloc_pud_early;
+	pt_ops.get_pud_virt = get_pud_virt_early;
+#else
 	pt_ops.alloc_pmd = alloc_pmd_early;
 	pt_ops.get_pmd_virt = get_pmd_virt_early;
 	pt_ops.alloc_pud = alloc_pud_early;
 	pt_ops.get_pud_virt = get_pud_virt_early;
+#endif
 	pt_ops.alloc_p4d = alloc_p4d_early;
 	pt_ops.get_p4d_virt = get_p4d_virt_early;
 #endif
@@ -1089,8 +1226,6 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	}
 #endif
 
-	kernel_map.virt_addr = KERNEL_LINK_ADDR + kernel_map.virt_offset;
-
 #ifdef CONFIG_XIP_KERNEL
 #ifdef CONFIG_64BIT
 	kernel_map.page_offset = PAGE_OFFSET_L3;
@@ -1104,19 +1239,55 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	kernel_map.phys_addr = (uintptr_t)CONFIG_PHYS_RAM_BASE;
 	kernel_map.size = (uintptr_t)(&_end) - (uintptr_t)(&_start);
 
+	kernel_map.virt_addr = KERNEL_LINK_ADDR + kernel_map.virt_offset;
 	kernel_map.va_kernel_xip_text_pa_offset = kernel_map.virt_addr - kernel_map.xiprom;
 	kernel_map.va_kernel_xip_data_pa_offset = kernel_map.virt_addr - kernel_map.phys_addr
 						+ (uintptr_t)&_sdata - (uintptr_t)&_start;
 #else
 	kernel_map.page_offset = _AC(CONFIG_PAGE_OFFSET, UL);
+	kernel_map.virt_addr = KERNEL_LINK_ADDR + kernel_map.virt_offset;
 	kernel_map.phys_addr = (uintptr_t)(&_start);
 	kernel_map.size = (uintptr_t)(&_end) - kernel_map.phys_addr;
-	kernel_map.va_kernel_pa_offset = kernel_map.virt_addr - kernel_map.phys_addr;
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	/*
+	 * MMU-off execution uses the Image load PA (e.g. 0x80200000), but
+	 * (uintptr_t)&_start is the link VMA. Early PTEs must use runtime PA.
+	 */
+	{
+		uintptr_t link_start;
+
+		/*
+		 * lla _start in C is the link VMA (0xffffffff80000000), not the
+		 * OpenSBI load PA (0x80200000). Early PTE/SATP must use load PA.
+		 */
+		asm volatile("lla %0, _start" : "=r"(link_start));
+		/*
+		 * With MMU off the Image runs at load PA; lla _start is already
+		 * physical (~0x80200000), not KERNEL_LINK_ADDR. Do not subtract
+		 * KERNEL_LINK_ADDR again (that produced 0x180400000 and broke
+		 * f2_early_ptr vs head.S f2_link_to_phys).
+		 */
+		kernel_map.phys_addr = link_start;
+		/* #region agent log */
+		{
+			void __iomem *uart = (void __iomem *)0x10000000UL;
+
+			writeb('P', uart);
+		}
+		/* #endregion */
+	}
+#endif
+#endif
+
+#ifndef CONFIG_XIP_KERNEL
+	kernel_map.va_kernel_pa_offset = kernel_map.virt_addr -
+					 kernel_map.phys_addr;
 #endif
 
 #if defined(CONFIG_64BIT) && !defined(CONFIG_XIP_KERNEL)
 	set_satp_mode(dtb_pa);
 	set_mmap_rnd_bits_max();
+	kernel_map.virt_addr = KERNEL_LINK_ADDR + kernel_map.virt_offset;
 #endif
 
 	/*
@@ -1163,8 +1334,14 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	pt_ops_set_early();
 
 	/* Setup early PGD for fixmap */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	create_pgd_mapping(f2_early_ptr(early_pg_dir), FIXADDR_START,
+			   (uintptr_t)f2_early_ptr(fixmap_pmd), PGDIR_SIZE,
+			   PAGE_TABLE);
+#else
 	create_pgd_mapping(early_pg_dir, FIXADDR_START,
 			   fixmap_pgd_next, PGDIR_SIZE, PAGE_TABLE);
+#endif
 
 #ifndef __PAGETABLE_PMD_FOLDED
 	/* Setup fixmap P4D and PUD */
@@ -1175,6 +1352,22 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	if (pgtable_l4_enabled)
 		create_pud_mapping(fixmap_pud, FIXADDR_START,
 				   (uintptr_t)fixmap_pmd, PUD_SIZE, PAGE_TABLE);
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	create_pmd_mapping(f2_early_ptr(fixmap_pmd), FIXADDR_START,
+			   (uintptr_t)fixmap_pte, PMD_SIZE, PAGE_TABLE);
+	/*
+	 * MMU-off: PTE stores must use PA. Sv39 leaf PGD for trampoline
+	 * (CVA6 PTW uses physical root from SATP).
+	 */
+	memset(f2_early_ptr(trampoline_pg_dir), 0, PAGE_SIZE);
+	create_pgd_mapping(f2_early_ptr(trampoline_pg_dir), kernel_map.virt_addr,
+			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+	{
+		void __iomem *uart = (void __iomem *)0x10000000UL;
+
+		writeb('T', uart);
+	}
+#else
 	create_pmd_mapping(fixmap_pmd, FIXADDR_START,
 			   (uintptr_t)fixmap_pte, PMD_SIZE, PAGE_TABLE);
 	/* Setup trampoline PGD and PMD */
@@ -1193,10 +1386,16 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	create_pmd_mapping(trampoline_pmd, kernel_map.virt_addr,
 			   kernel_map.phys_addr, PMD_SIZE, PAGE_KERNEL_EXEC);
 #endif
+#endif
 #else
 	/* Setup trampoline PGD */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	create_pgd_mapping(f2_early_ptr(trampoline_pg_dir), kernel_map.virt_addr,
+			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#else
 	create_pgd_mapping(trampoline_pg_dir, kernel_map.virt_addr,
 			   kernel_map.phys_addr, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+#endif
 #endif
 
 	/*
@@ -1204,7 +1403,35 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 	 * us to reach paging_init(). We map all memory banks later
 	 * in setup_vm_final() below.
 	 */
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	/*
+	 * Map every 2MiB of the loaded Image at link VA using early tables
+	 * stored at load PA (f2_early_ptr + f2_alloc_*_early). A single PGDIR
+	 * leaf missed deep text (IAF @ do_trap_insn_fault); link-VA early_pmd
+	 * broke create_kernel_page_table until alloc helpers were fixed.
+	 */
+	create_kernel_page_table(f2_early_ptr(early_pg_dir), true);
+	/*
+	 * MMU-off PC uses load PAs (0x802…); CVA6 does not reliably trap to
+	 * stvec on the first SATP. Identity-map low gigabytes for fall-through.
+	 */
+	{
+		uintptr_t load_gig = kernel_map.phys_addr & PGDIR_MASK;
+
+		create_pgd_mapping(f2_early_ptr(early_pg_dir),
+				   load_gig, load_gig, PGDIR_SIZE, PAGE_KERNEL_EXEC);
+		create_pgd_mapping(f2_early_ptr(early_pg_dir),
+				   0UL, 0UL, PGDIR_SIZE, PAGE_KERNEL);
+	}
+	/* UART via fixmap (0x10000000 must not use PGD[0] — clashes with kernel VA) */
+	create_pte_mapping(f2_early_ptr(fixmap_pte),
+			   __fix_to_virt(FIX_EARLYCON_MEM_BASE),
+			   0x10000000UL, PAGE_SIZE, PAGE_KERNEL);
+	f2_earlycon_uart_va = __fix_to_virt(FIX_EARLYCON_MEM_BASE);
+	writeb('U', (void __iomem *)0x10000000UL);
+#else
 	create_kernel_page_table(early_pg_dir, true);
+#endif
 
 	/* Setup early mapping for FDT early scan */
 	create_fdt_early_page_table(__fix_to_virt(FIX_FDT), dtb_pa);
@@ -1240,6 +1467,16 @@ asmlinkage void __init setup_vm(uintptr_t dtb_pa)
 #endif
 
 	pt_ops_set_fixmap();
+
+#ifdef CONFIG_CVA6_F2_NO_AMO
+	{
+		u64 satp_val = PFN_DOWN((uintptr_t)f2_early_ptr(early_pg_dir)) |
+			       satp_mode;
+
+		*(u64 *)f2_early_ptr(&f2_satp_early_pgdir) = satp_val;
+		f2_uart_readback_early_pt(satp_val);
+	}
+#endif
 }
 
 static void __meminit create_linear_mapping_range(phys_addr_t start, phys_addr_t end,

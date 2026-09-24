@@ -8,6 +8,10 @@
 #ifndef _ASM_RISCV_ATOMIC_H
 #define _ASM_RISCV_ATOMIC_H
 
+#ifdef CONFIG_CVA6_F2_NO_AMO
+#include <asm/cva6_f2_namo.h>
+#else /* CONFIG_CVA6_F2_NO_AMO */
+
 #ifdef CONFIG_GENERIC_ATOMIC64
 # include <asm-generic/atomic64.h>
 #else
@@ -349,5 +353,7 @@ static __always_inline s64 arch_atomic64_dec_if_positive(atomic64_t *v)
 
 #define arch_atomic64_dec_if_positive	arch_atomic64_dec_if_positive
 #endif
+
+#endif /* !CONFIG_CVA6_F2_NO_AMO */
 
 #endif /* _ASM_RISCV_ATOMIC_H */
